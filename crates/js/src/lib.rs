@@ -18,8 +18,12 @@
 //!   `show`, `clear`), `display` and `color`.
 //!
 //! The engine is a sandbox: no file, network or timer access exists, and loops and recursion
-//! are bounded. Side effects (alerts, field changes, resets, printing, navigation) are returned
-//! in an [`Outcome`] for the caller to apply.
+//! are bounded ([`run_within`] also bounds the time). Side effects (alerts, field changes,
+//! resets, printing, navigation) are returned in an [`Outcome`] for the caller to apply.
+//!
+//! Memory is not bounded: boa has no heap limit and a failed allocation aborts the process, so
+//! a hostile script (`s = s + s` forty times) can end the app. Turning JavaScript off is the
+//! workaround until scripts run in a child process.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
