@@ -348,7 +348,10 @@ impl Certificate {
     }
 }
 
-/// The chain from `leaf` up through `pool`, as far as issuers can be found and their keys
+/// Key usage bit 5 (see [`Certificate::key_usage`]).
+const KEY_CERT_SIGN: u16 = 1 << 5;
+
+/// The chain from `leaf` up through `pool`, as far as CA issuers can be found and their keys
 /// verify the certificate below. Stops at a self-signed certificate.
 pub fn build_chain<'a>(leaf: &'a Certificate, pool: &'a [Certificate]) -> Vec<&'a Certificate> {
     let mut chain = vec![leaf];
@@ -357,7 +360,11 @@ pub fn build_chain<'a>(leaf: &'a Certificate, pool: &'a [Certificate]) -> Vec<&'
         if last.issuer.raw == last.subject.raw {
             break;
         }
-        let Some(issuer) = pool.iter().find(|c| c.subject.raw == last.issuer.raw && !chain.contains(c) && last.signed_by(&c.public_key)) else {
+        // Only a CA may issue (RFC 5280 §4.2.1.3, §4.2.1.9): an end entity can't vouch for others.
+        let can_issue = |c: &Certificate| c.is_ca && c.key_usage.is_none_or(|u| u & KEY_CERT_SIGN != 0);
+        let Some(issuer) =
+            pool.iter().find(|c| c.subject.raw == last.issuer.raw && can_issue(c) && !chain.contains(c) && last.signed_by(&c.public_key))
+        else {
             break;
         };
         chain.push(issuer);

@@ -430,11 +430,7 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
                     // Only a token from a trusted authority (valid when it stamped) is trusted
                     // time; otherwise its time is reported but validation uses the signer's
                     // own claimed time, as without a timestamp.
-                    let mut pool = crate::timestamp::token_certs(raw);
-                    pool.extend(trust.certs.iter().cloned());
-                    let trusted_tsa =
-                        t.signer_certificate().is_some_and(|c| c.valid_at(t.gen_time) && build_chain(&c, &pool).iter().any(|x| trust.trusts(x)));
-                    if trusted_tsa {
+                    if trusted_tsa(raw, t.signer_certificate().as_ref(), t.gen_time, trust) {
                         info.timestamp_time = Some(t.gen_time);
                     } else {
                         unverified_time = Some(t.gen_time);
@@ -501,9 +497,9 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
         }
     }
     if let Some(t) = info.timestamp_time.or(info.signing_time)
-        && !cert.valid_at(t)
+        && !info.chain.iter().all(|c| c.valid_at(t))
     {
-        info.details.push("The signer's certificate was not valid at the time of signing.".into());
+        info.details.push("The signer's certificate or one of its issuers was not valid at the time of signing.".into());
         // A verified revocation already made the signature invalid; keep it that way.
         if !problems && !revoked {
             info.status = Status::Unknown;
@@ -533,9 +529,21 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
         info.details.push(format!("The embedded timestamp token is valid and its authority is trusted; trusted time is {t}."));
     } else if let Some(t) = unverified_time {
         info.details.push(format!(
-            "The signature carries an unverified timestamp ({t}): the timestamp authority is not in your list of trusted certificates, so the signing time claimed by the signer is used instead."
+            "The signature carries an unverified timestamp ({t}): its authority is not trusted for timestamps, so the signing time claimed by the signer is used instead."
         ));
     }
+}
+
+/// Whether a timestamp token (`raw`, signed by `tsa`) is trusted time: its signer is a timestamp
+/// authority (RFC 3161 §2.3), valid at `gen_time`, chaining to the trust store.
+fn trusted_tsa(raw: &[u8], tsa: Option<&Certificate>, gen_time: Time, trust: &TrustStore) -> bool {
+    const EKU_TIME_STAMPING: &str = "1.3.6.1.5.5.7.3.8";
+    let Some(tsa) = tsa else { return false };
+    let mut pool = crate::timestamp::token_certs(raw);
+    pool.extend(trust.certs.iter().cloned());
+    tsa.extended_key_usage.as_ref().is_some_and(|e| e.iter().any(|o| o == EKU_TIME_STAMPING))
+        && tsa.valid_at(gen_time)
+        && build_chain(tsa, &pool).iter().any(|x| trust.trusts(x))
 }
 
 /// Check the revocation evidence in the catalog's `/DSS` against the signer's chain at `at`.
@@ -667,15 +675,12 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
     if info.status != Status::Invalid {
         // An untrusted TSA is not proof of anything: the verdict stays Unknown, like an
         // ordinary signature from an unknown signer.
-        let mut pool = crate::timestamp::token_certs(&contents);
-        pool.extend(trust.certs.iter().cloned());
-        let trusted_tsa = token.signer_certificate().map(|c| build_chain(&c, &pool).iter().any(|x| trust.trusts(x))).unwrap_or(false);
-        if trusted_tsa {
+        if trusted_tsa(&contents, token.signer_certificate().as_ref(), token.gen_time, trust) {
             info.status = Status::Valid;
             info.details.push("The timestamp token is valid and its authority is trusted.".into());
         } else {
             info.status = Status::Unknown;
-            info.details.push("The timestamp token is valid, but the timestamp authority is not in your list of trusted certificates.".into());
+            info.details.push("The timestamp token is valid, but its authority is not trusted for timestamps.".into());
         }
     }
 }
