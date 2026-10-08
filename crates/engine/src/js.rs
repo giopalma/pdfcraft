@@ -108,12 +108,22 @@ pub struct JsRunner {
     pub output: JsOutput,
     /// The fields in the document as the forms code last read them (for `display`).
     cos: pdfcraft_cos::Document,
+    /// Time the scripts of one edit may take in all; once spent, the rest are skipped.
+    clock: crate::xfa::Clock,
+    skipped: usize,
 }
 
 impl JsRunner {
     pub fn new(cos: &pdfcraft_cos::Document, file_name: &str) -> JsRunner {
         let doc = pdfcraft_js::DocInfo { file_name: file_name.to_string(), num_pages: pdfcraft_model::pages(cos).len(), page: 0, info: info(cos) };
-        JsRunner { doc, doc_scripts: pdfcraft_forms::document_scripts(cos), output: JsOutput::default(), cos: cos.clone() }
+        JsRunner {
+            doc,
+            doc_scripts: pdfcraft_forms::document_scripts(cos),
+            output: JsOutput::default(),
+            cos: cos.clone(),
+            clock: crate::xfa::Clock::start(crate::xfa::EVENT_BUDGET_MS),
+            skipped: 0,
+        }
     }
 }
 
@@ -130,9 +140,17 @@ fn info(cos: &pdfcraft_cos::Document) -> Vec<(String, String)> {
 
 impl Scripts for JsRunner {
     fn run(&mut self, event: FieldEvent, script: &str, target: &Field, value: &str, fields: &[Field]) -> ScriptResult {
+        if self.clock.spent() {
+            if self.skipped == 0 {
+                let secs = crate::xfa::EVENT_BUDGET_MS / 1000;
+                self.output.errors.push(format!("The form's scripts were stopped: they took more than {secs} seconds; later ones were skipped"));
+            }
+            self.skipped += 1;
+            return ScriptResult { rc: true, value: value.to_string(), changes: Vec::new(), message: None };
+        }
         let states: Vec<_> = fields.iter().map(|f| field_state(&self.cos, f)).collect();
         let ev = pdfcraft_js::Event::field(event.name(), &target.name, value);
-        let o = pdfcraft_js::run(script, &ev, &self.doc, &states, &self.doc_scripts, Limits::default());
+        let o = pdfcraft_js::run_within(script, &ev, &self.doc, &states, &self.doc_scripts, Limits::default(), self.clock.left());
         self.output.absorb(&o);
         if o.error.is_some() {
             // As in Acrobat, a failing script leaves the value alone (the error goes to the console).
@@ -212,7 +230,7 @@ impl Session {
             Some(t) => pdfcraft_js::Event { will_commit: false, ..pdfcraft_js::Event::field("Mouse Up", t, "") },
             None => pdfcraft_js::Event::doc("Console"),
         };
-        let mut o = pdfcraft_js::run(script, &event, &runner.doc, &states, &runner.doc_scripts, Limits::default());
+        let mut o = pdfcraft_js::run_within(script, &event, &runner.doc, &states, &runner.doc_scripts, Limits::default(), runner.clock.left());
         let after: Vec<_> = states.iter().map(|s| o.changed.iter().find(|c| c.name == s.name).unwrap_or(s).clone()).collect();
         let changes = changes(&states, &after);
         let resets: Vec<Vec<String>> = o

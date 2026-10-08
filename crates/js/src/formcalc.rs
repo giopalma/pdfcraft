@@ -13,9 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::Limits;
+use crate::on_script_thread;
 use crate::xfa::{
-    HNode, XHost, XfaDoc, XfaEffect, XfaEvent, XfaKind, XfaNode, XfaOutcome, child_named, clip, clip_result, descendants_named, instances,
-    resolve_som, run_within,
+    HNode, XHost, XfaDoc, XfaEffect, XfaEvent, XfaKind, XfaNode, XfaOutcome, abandoned, child_named, clip, clip_result, descendants_named, instances,
+    resolve_som,
 };
 
 /// Deepest nesting the parser follows.
@@ -2543,7 +2544,8 @@ pub(crate) fn run_formcalc_at(
 /// [`run_formcalc`] on its own thread, abandoned after `timeout` (and told to stop itself then).
 pub fn run_formcalc_within(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNode, limits: Limits, timeout: std::time::Duration) -> XfaOutcome {
     let (script, event, doc) = (script.to_string(), event.clone(), doc.clone());
-    run_within("pdfcraft-formcalc", timeout, move || run_formcalc_at(&script, &event, &doc, root, limits, Some(timeout)))
+    on_script_thread("pdfcraft-formcalc", timeout, move || run_formcalc_at(&script, &event, &doc, root, limits, Some(timeout)))
+        .unwrap_or_else(abandoned)
 }
 
 #[cfg(test)]

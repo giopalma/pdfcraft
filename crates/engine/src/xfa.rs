@@ -27,7 +27,7 @@ const MAX_ERRORS_PER_EVENT: usize = 100;
 /// Time the scripts of one event may take in all before the rest are skipped: opening (and
 /// the calculations every change runs) is held tighter than a click.
 const OPEN_BUDGET_MS: u64 = 3_000;
-const EVENT_BUDGET_MS: u64 = 5_000;
+pub(crate) const EVENT_BUDGET_MS: u64 = 5_000;
 
 /// Engine limits for one script: initialize, calculate and validate scripts run without the
 /// user asking (on open, on every change), so they get fewer loop iterations than a click.
@@ -61,14 +61,14 @@ fn click_only(e: &XfaEffect) -> Option<&'static str> {
 /// A wall clock where there is one (not in the browser build, where the script and relayout
 /// caps alone bound an event).
 #[derive(Clone, Copy)]
-struct Clock {
+pub(crate) struct Clock {
     #[cfg(not(target_arch = "wasm32"))]
     started: std::time::Instant,
     budget_ms: u64,
 }
 
 impl Clock {
-    fn start(budget_ms: u64) -> Self {
+    pub(crate) fn start(budget_ms: u64) -> Self {
         Clock {
             #[cfg(not(target_arch = "wasm32"))]
             started: std::time::Instant::now(),
@@ -76,15 +76,20 @@ impl Clock {
         }
     }
 
-    fn spent(&self) -> bool {
+    pub(crate) fn spent(&self) -> bool {
+        self.left().is_zero()
+    }
+
+    /// What is left of the budget (all of it in the browser build, which has no clock).
+    pub(crate) fn left(&self) -> std::time::Duration {
+        let budget = std::time::Duration::from_millis(self.budget_ms);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.started.elapsed() >= std::time::Duration::from_millis(self.budget_ms)
+            budget.saturating_sub(self.started.elapsed())
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = self.budget_ms;
-            false
+            budget
         }
     }
 }

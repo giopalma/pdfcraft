@@ -15,7 +15,7 @@ use boa_engine::object::builtins::{JsArray, JsProxy};
 use boa_engine::property::Attribute;
 use boa_engine::{Context, JsObject, JsResult, JsString, JsValue, NativeFunction, Source, js_string};
 
-use crate::{Limits, arg, as_number, error, function, platform, printd, printf, printx, refuse, s, text};
+use crate::{Limits, arg, as_number, error, function, on_script_thread, platform, printd, printf, printx, refuse, s, text};
 
 /// What kind of template object a node is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1366,39 +1366,12 @@ pub fn run_xfa_within(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNod
         return XfaOutcome { error: Some(why), ..Default::default() };
     }
     let (script, event, doc) = (script.to_string(), event.clone(), doc.clone());
-    run_within("pdfcraft-xfa-js", timeout, move || run_here(&script, &event, &doc, root, limits))
+    on_script_thread("pdfcraft-xfa-js", timeout, move || run_here(&script, &event, &doc, root, limits)).unwrap_or_else(abandoned)
 }
 
-/// Run `script` on its own thread (with the script stack) and wait at most `timeout` for its
-/// outcome; past that the thread is abandoned and the outcome says so. On wasm there are no
-/// threads: the script runs here.
-pub(crate) fn run_within(name: &str, timeout: std::time::Duration, script: impl FnOnce() -> XfaOutcome + Send + 'static) -> XfaOutcome {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let failed = |why: String| XfaOutcome { error: Some(why), ..Default::default() };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new().name(name.into()).stack_size(crate::SCRIPT_STACK).spawn(move || {
-            // The receiver is gone when the caller stopped waiting: nothing to report then.
-            let _ = tx.send(script());
-        });
-        if let Err(e) = spawned {
-            return failed(format!("the script engine could not start: {e}"));
-        }
-        match rx.recv_timeout(timeout) {
-            Ok(o) => o,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => XfaOutcome {
-                error: Some(format!("the script ran longer than {:.1} s and was abandoned", timeout.as_secs_f64())),
-                abandoned: true,
-                ..Default::default()
-            },
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => failed("the script stopped with an internal error".into()),
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (name, timeout);
-        script()
-    }
+/// The outcome of a script [`on_script_thread`] got no result from.
+pub(crate) fn abandoned((why, abandoned): (String, bool)) -> XfaOutcome {
+    XfaOutcome { error: Some(why), abandoned, ..Default::default() }
 }
 
 fn run_here(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNode, limits: Limits) -> XfaOutcome {

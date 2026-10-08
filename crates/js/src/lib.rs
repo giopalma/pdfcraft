@@ -1095,6 +1095,92 @@ pub fn run(script: &str, event: &Event, doc: &DocInfo, fields: &[FieldState], do
     run_here(script, event, doc, fields, doc_scripts, limits)
 }
 
+/// [`run`] with a time limit: a script still running after `timeout` (a loop calling a function
+/// that loops runs for hours within the engine's per-frame loop limit) is left on its thread,
+/// which ends when the engine's own limits stop it, and a failed outcome comes back at once. In
+/// the browser build there are no threads: the script runs to its limits.
+pub fn run_within(
+    script: &str,
+    event: &Event,
+    doc: &DocInfo,
+    fields: &[FieldState],
+    doc_scripts: &[String],
+    limits: Limits,
+    timeout: std::time::Duration,
+) -> Outcome {
+    let failed = |why: String| Outcome { rc: true, value: event.value.clone(), change: event.change.clone(), error: Some(why), ..Default::default() };
+    if let Some(why) = std::iter::once(script).chain(doc_scripts.iter().map(String::as_str)).find_map(refuse) {
+        return failed(why);
+    }
+    let (script, owned_event, doc, fields, doc_scripts) = (script.to_string(), event.clone(), doc.clone(), fields.to_vec(), doc_scripts.to_vec());
+    on_script_thread("pdfcraft-js", timeout, move || run_here(&script, &owned_event, &doc, &fields, &doc_scripts, limits))
+        .unwrap_or_else(|(why, _)| failed(why))
+}
+
+/// Most abandoned scripts left running at once. Each keeps a thread busy until the engine's own
+/// limits stop it, so past this no new script starts: a document can't pile them up.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_ABANDONED: usize = 4;
+#[cfg(not(target_arch = "wasm32"))]
+static ABANDONED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run `script` on its own thread (with the script stack) and wait at most `timeout` for its
+/// result; past that the thread is abandoned. `Err((why, abandoned))` when there is no result.
+/// On wasm there are no threads: the script runs here.
+pub(crate) fn on_script_thread<T: Send + 'static>(
+    name: &str,
+    timeout: std::time::Duration,
+    script: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, (String, bool)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+        const RUNNING: u8 = 0;
+        const DONE: u8 = 1;
+        const LEFT: u8 = 2;
+        /// Marks the script finished (even if it panicked) and releases its abandoned slot.
+        struct Finished(Arc<AtomicU8>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                if self.0.swap(DONE, SeqCst) == LEFT {
+                    ABANDONED.fetch_sub(1, SeqCst);
+                }
+            }
+        }
+        if ABANDONED.load(SeqCst) >= MAX_ABANDONED {
+            return Err(("scripts that ran too long are still running, so no more scripts start until they finish".into(), false));
+        }
+        let state = Arc::new(AtomicU8::new(RUNNING));
+        let finished = Finished(state.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name(name.into()).stack_size(SCRIPT_STACK).spawn(move || {
+            let _finished = finished;
+            // The receiver is gone when the caller stopped waiting: nothing to report then.
+            let _ = tx.send(script());
+        });
+        if let Err(e) = spawned {
+            return Err((format!("the script engine could not start: {e}"), false));
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(o) => Ok(o),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                ABANDONED.fetch_add(1, SeqCst);
+                if state.compare_exchange(RUNNING, LEFT, SeqCst, SeqCst).is_err() {
+                    ABANDONED.fetch_sub(1, SeqCst); // it finished just now: nothing left running
+                }
+                Err((format!("the script ran longer than {:.1} s and was abandoned", timeout.as_secs_f64()), true))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(("the script stopped with an internal error".into(), false)),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (name, timeout);
+        Ok(script())
+    }
+}
+
 fn run_here(script: &str, event: &Event, doc: &DocInfo, fields: &[FieldState], doc_scripts: &[String], limits: Limits) -> Outcome {
     let mut ctx = Context::default();
     ctx.runtime_limits_mut().set_loop_iteration_limit(limits.loop_iterations);

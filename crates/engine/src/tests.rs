@@ -1390,6 +1390,12 @@ fn recognize_text_makes_a_scanned_page_searchable() {
 /// A form whose scripts are custom JavaScript: total = price × qty (calculate, through a
 /// document-level function), shown with a custom format; qty is validated; a button script.
 fn scripted_form() -> Vec<u8> {
+    scripted_form_with("console.println('times'); return a * b;")
+}
+
+/// [`scripted_form`] with `times_body` (PDF string syntax) as the body of its document-level
+/// `times(a, b)`.
+fn scripted_form_with(times_body: &str) -> Vec<u8> {
     let text = |name: &str, y: u32, aa: &str| {
         format!("<< /Type /Annot /Subtype /Widget /FT /Tx /T ({name}) /Rect [20 {y} 180 {}] /P 3 0 R /F 4 {aa} >>", y + 20)
     };
@@ -1403,7 +1409,7 @@ fn scripted_form() -> Vec<u8> {
         "<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (go) /Rect [20 150 80 170] /P 3 0 R /F 4 >>".to_string(),
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
         "<< >>".to_string(),
-        "<< /S /JavaScript /JS (function times\\(a, b\\) { console.println('times'); return a * b; }) >>".to_string(),
+        format!("<< /S /JavaScript /JS (function times\\(a, b\\) {{ {times_body} }}) >>"),
     ];
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
@@ -1449,6 +1455,22 @@ fn form_javascript_validates_calculates_and_formats() {
     s.apply(id, Edit::SetFieldValue { name: "qty".into(), value: FieldValue::Text("500".into()) }).unwrap();
     assert_eq!(value(&s, "total"), ["12"]);
     assert!(s.run_javascript(id, "1", None).is_err());
+}
+
+#[test]
+fn slow_form_scripts_cannot_freeze_an_edit() {
+    // Each frame stays under the engine's loop limit (a loop calling a function that loops), so
+    // only the time budget stops the calculation; the thread it is left on ends by itself later.
+    let slow = "function f\\(\\) { var n = 0; for \\(var j = 0; j < 900000; j++\\) n++; return n; } for \\(var i = 0; i < 600; i++\\) f\\(\\); return a * b;";
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("slow.pdf", None, Arc::new(scripted_form_with(slow)), None).unwrap();
+    let started = std::time::Instant::now();
+    s.apply(id, Edit::SetFieldValue { name: "qty".into(), value: FieldValue::Text("4".into()) }).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(15), "{:?}", started.elapsed());
+    let value = s.get(id).unwrap().form.iter().find(|f| f.name == "qty").unwrap().value.clone();
+    assert_eq!(value, ["4"], "the edit itself is kept");
+    let out = s.take_js_output(id);
+    assert!(out.errors.iter().any(|e| e.contains("abandoned")), "{out:?}");
 }
 
 #[test]
